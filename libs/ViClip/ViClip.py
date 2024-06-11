@@ -61,7 +61,7 @@ class ViCLIP(nn.Module):
         self.temp_min = 1 / 100.0
 
         if pretrain:
-            logger.info(f"Load pretrained weights from {pretrain}")
+            print(f"Load pretrained weights from {pretrain}")
             state_dict = torch.load(pretrain, map_location="cpu")["model"]
             self.load_state_dict(state_dict)
 

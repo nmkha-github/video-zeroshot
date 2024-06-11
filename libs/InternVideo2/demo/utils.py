@@ -1,7 +1,9 @@
 import numpy as np
 import cv2
-import os
+import os, sys
 import io
+
+sys.path.append(os.path.join(os.getcwd(), "libs/InternVideo2"))
 
 import torch
 from torch import nn
@@ -9,7 +11,15 @@ from torch import nn
 from models.backbones.internvideo2 import pretrain_internvideo2_1b_patch14_224
 from models.backbones.bert.builder import build_bert
 from models.criterions import get_sim
-from models.backbones.internvideo2.pos_embed import interpolate_pos_embed_internvideo2_new
+from models.backbones.internvideo2.pos_embed import (
+    interpolate_pos_embed_internvideo2_new,
+)
+from models.backbones.bert.xbert import (
+    BertConfig,
+    BertForMaskedLM,
+    BertLMHeadModel,
+    BertModel,
+)
 from models.backbones.bert.tokenization_bert import BertTokenizer
 
 
@@ -20,18 +30,23 @@ def _frame_from_video(video):
             yield frame
         else:
             break
-        
-v_mean = np.array([0.485, 0.456, 0.406]).reshape(1,1,3)
-v_std = np.array([0.229, 0.224, 0.225]).reshape(1,1,3)
+
+
+v_mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
+v_std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+
+
 def normalize(data):
-    return (data/255.0-v_mean)/v_std
+    return (data / 255.0 - v_mean) / v_std
 
 
-def frames2tensor(vid_list, fnum=8, target_size=(224, 224), device=torch.device('cuda')):
-    assert(len(vid_list) >= fnum)
+def frames2tensor(
+    vid_list, fnum=8, target_size=(224, 224), device=torch.device("cuda")
+):
+    assert len(vid_list) >= fnum
     step = len(vid_list) // fnum
     vid_list = vid_list[::step][:fnum]
-    vid_list = [cv2.resize(x[:,:,::-1], target_size) for x in vid_list]
+    vid_list = [cv2.resize(x[:, :, ::-1], target_size) for x in vid_list]
     vid_tube = [np.expand_dims(normalize(x), axis=(0, 1)) for x in vid_list]
     vid_tube = np.concatenate(vid_tube, axis=1)
     vid_tube = np.transpose(vid_tube, (0, 1, 4, 2, 3))
@@ -50,26 +65,25 @@ def get_vid_feat(frames, vlm):
     return vlm.get_vid_features(frames)
 
 
-def retrieve_text(frames, 
-                  texts, 
-                  model,
-                  topk:int=5,
-                  config: dict={},
-                  device=torch.device('cuda')):
-    
+def retrieve_text(
+    frames, texts, model, topk: int = 5, config: dict = {}, device=torch.device("cuda")
+):
+
     vlm = model
     vlm = vlm.to(device)
-    
-    fn = config.get('num_frames', 8)
-    size_t = config.get('size_t', 224)
-    frames_tensor = frames2tensor(frames, fnum=fn, target_size=(size_t, size_t), device=device)
+
+    fn = config.get("num_frames", 8)
+    size_t = config.get("size_t", 224)
+    frames_tensor = frames2tensor(
+        frames, fnum=fn, target_size=(size_t, size_t), device=device
+    )
     vid_feat = vlm.get_vid_feat(frames_tensor)
 
     text_feat_d = {}
     text_feat_d = get_text_feat_dict(texts, vlm, text_feat_d)
     text_feats = [text_feat_d[t] for t in texts]
     text_feats_tensor = torch.cat(text_feats, 0)
-    
+
     probs, idxs = vlm.predict_label(vid_feat, text_feats_tensor, top=topk)
 
     ret_texts = [texts[i] for i in idxs.long().numpy()[0].tolist()]
@@ -78,55 +92,72 @@ def retrieve_text(frames,
 
 def setup_internvideo2(config: dict):
     if "bert" in config.model.text_encoder.name:
-        tokenizer = BertTokenizer.from_pretrained(config.model.text_encoder.pretrained, local_files_only=True)
-        model = InternVideo2_Stage2(config=config, tokenizer=tokenizer, is_pretrain=True)
+        tokenizer = BertTokenizer.from_pretrained(
+            config.model.text_encoder.pretrained, local_files_only=False
+        )
+        print(config.model.text_encoder.pretrained)
+        model = InternVideo2_Stage2(
+            config=config, tokenizer=tokenizer, is_pretrain=True
+        )
     else:
         model = InternVideo2_Stage2(config=config, is_pretrain=True)
         tokenizer = model.tokenizer
-
-    if config.get('compile_model', False):
-        torch.set_float32_matmul_precision('high')
+    print(1)
+    if config.get("compile_model", False):
+        torch.set_float32_matmul_precision("high")
         model = torch.compile(model)
 
     model = model.to(torch.device(config.device))
     model_without_ddp = model
+    print(2)
 
-    if (config.pretrained_path.strip() and (os.path.isfile(config.pretrained_path)) or "s3://" in config.pretrained_path):
+    if (
+        config.pretrained_path.strip()
+        and (os.path.isfile(config.pretrained_path))
+        or "s3://" in config.pretrained_path
+    ):
+        print(config.pretrained_path)
         checkpoint = torch.load(config.pretrained_path, map_location="cpu")
         try:
             if "model" in checkpoint.keys():
                 state_dict = checkpoint["model"]
             else:
-                state_dict = checkpoint["module"] # This is a deepspeed stage 1 model
-        except:  
+                state_dict = checkpoint["module"]  # This is a deepspeed stage 1 model
+        except:
             state_dict = checkpoint
 
-        if config.get('origin_num_frames', None) is not None:
+        if config.get("origin_num_frames", None) is not None:
             a = len(state_dict)
-            interpolate_pos_embed_internvideo2_new(state_dict, model_without_ddp.vision_encoder, orig_t_size=config.origin_num_frames)
+            interpolate_pos_embed_internvideo2_new(
+                state_dict,
+                model_without_ddp.vision_encoder,
+                orig_t_size=config.origin_num_frames,
+            )
             assert a == len(state_dict), state_dict.keys()
 
         msg = model_without_ddp.load_state_dict(state_dict, strict=False)
         print(f"load_state_dict: {msg}")
-    
-    if config.get('use_bf16', False):
+    print(3)
+
+    if config.get("use_bf16", False):
         model_without_ddp = model_without_ddp.to(torch.bfloat16)
-    elif config.get('use_half_precision', False):
+    elif config.get("use_half_precision", False):
         model_without_ddp = model_without_ddp.to(torch.float16)
     else:
         model_without_ddp = model_without_ddp.to(torch.float32)
-    
+    print(4)
+
     model_without_ddp.eval()
-    return (model_without_ddp, tokenizer,)
+    return (
+        model_without_ddp,
+        tokenizer,
+    )
 
 
 class InternVideo2_Stage2(nn.Module):
     """docstring for InternVideo2_Stage2"""
 
-    def __init__(self, 
-                 config, 
-                 tokenizer, 
-                 is_pretrain: bool=True):
+    def __init__(self, config, tokenizer, is_pretrain: bool = True):
         super(InternVideo2_Stage2, self).__init__()
 
         self.config = config
@@ -161,9 +192,7 @@ class InternVideo2_Stage2(nn.Module):
     def dtype(self):
         return self.vision_encoder.patch_embed.proj.weight.dtype
 
-    def encode_vision(self, 
-                      image: torch.Tensor, 
-                      test: bool=False):
+    def encode_vision(self, image: torch.Tensor, test: bool = False):
         """encode image / videos as features.
 
         Args:
@@ -177,27 +206,42 @@ class InternVideo2_Stage2(nn.Module):
             - clip_output (torch.Tensor): The features of clip. Shape: [K,B,N,C].
 
         """
-        
+
         T = image.shape[1]
         use_image = True if T == 1 else False
-        image = image.permute(0, 2, 1, 3, 4).to(self.dtype) # [B,T,C,H,W] -> [B,C,T,H,W]
+        image = image.permute(0, 2, 1, 3, 4).to(
+            self.dtype
+        )  # [B,T,C,H,W] -> [B,C,T,H,W]
         # whether save temporal dimension
         # keep_temporal=self.config.model.vision_encoder.keep_temporal
         if test:
             vision_embeds, pooled_vision_embeds, _, _ = self.vision_encoder(
-                image, None, use_image)
+                image, None, use_image
+            )
             return vision_embeds, pooled_vision_embeds
         else:
-            mask, targets_clip_middle_vis, targets_clip_final_vis = self.encode_teacher(image) 
+            mask, targets_clip_middle_vis, targets_clip_final_vis = self.encode_teacher(
+                image
+            )
             # if mask is not None and (self.video_mask_type != 'tube' or self.image_mask_type != 'tube'):
             #     keep_temporal = False
             # print(f"\033[31mmask is {type(mask)}\033[0m")
-            vision_embeds, pooled_vision_embeds, student_output, student_output_final = self.vision_encoder(
-                    image, mask, use_image)
-            return vision_embeds, pooled_vision_embeds, student_output, student_output_final, targets_clip_middle_vis, targets_clip_final_vis
+            (
+                vision_embeds,
+                pooled_vision_embeds,
+                student_output,
+                student_output_final,
+            ) = self.vision_encoder(image, mask, use_image)
+            return (
+                vision_embeds,
+                pooled_vision_embeds,
+                student_output,
+                student_output_final,
+                targets_clip_middle_vis,
+                targets_clip_final_vis,
+            )
 
-    def encode_text(self, 
-                    text: dict):
+    def encode_text(self, text: dict):
         """encode text.
         Args:
             text (dict): The output of huggingface's `PreTrainedTokenizer`. contains keys:
@@ -219,14 +263,75 @@ class InternVideo2_Stage2(nn.Module):
         pooled_text_embeds = text_embeds[:, 0]
         return text_embeds, pooled_text_embeds
 
+    @staticmethod
+    def build_bert(model_config, pretrain, checkpoint, encoder_width=None):
+        """build text encoder.
+
+        Args:
+            model_config (dict): model config.
+            pretrain (bool): Whether to do pretrain or finetuning.
+            checkpoint (bool): whether to do gradient_checkpointing.
+
+        Returns: TODO
+
+        """
+        bert_config = BertConfig.from_json_file(
+            os.path.join(os.getcwd(), "libs/InternVideo2/configs/config_bert.json")
+        )
+        if encoder_width is None:
+            bert_config.encoder_width = model_config.vision_encoder.d_model
+        else:
+            bert_config.encoder_width = encoder_width
+
+        bert_config.gradient_checkpointing = checkpoint
+        bert_config.fusion_layer = model_config.text_encoder.fusion_layer
+
+        if not model_config.multimodal.enable:
+            bert_config.fusion_layer = bert_config.num_hidden_layers
+
+        if pretrain:
+            try:
+                text_encoder, loading_info = BertForMaskedLM.from_pretrained(
+                    model_config.text_encoder.pretrained,
+                    config=bert_config,
+                    output_loading_info=True,
+                    local_files_only=True,
+                )
+            except:
+                text_encoder, loading_info = BertForMaskedLM.from_pretrained(
+                    model_config.text_encoder.pretrained,
+                    config=bert_config,
+                    output_loading_info=True,
+                    local_files_only=False,
+                )
+        else:
+            try:
+                text_encoder, loading_info = BertModel.from_pretrained(
+                    model_config.text_encoder.pretrained,
+                    config=bert_config,
+                    add_pooling_layer=False,
+                    output_loading_info=True,
+                    local_files_only=True,
+                )
+            except:
+                text_encoder, loading_info = BertModel.from_pretrained(
+                    model_config.text_encoder.pretrained,
+                    config=bert_config,
+                    add_pooling_layer=False,
+                    output_loading_info=True,
+                    local_files_only=False,
+                )
+
+        return text_encoder
+
     def build_vision_encoder(self):
         """build vision encoder
         Returns: (vision_encoder, clip_teacher). Each is a `nn.Module`.
 
         """
         encoder_name = self.config.model.vision_encoder.name
-        
-        if encoder_name == 'pretrain_internvideo2_1b_patch14_224':
+
+        if encoder_name == "pretrain_internvideo2_1b_patch14_224":
             vision_encoder = pretrain_internvideo2_1b_patch14_224(self.config.model)
         else:
             raise ValueError(f"Not implemented: {encoder_name}")
@@ -238,12 +343,16 @@ class InternVideo2_Stage2(nn.Module):
         patch_size = self.config.model.vision_encoder.patch_size
         self.clip_img_size = self.config.model.vision_encoder.clip_input_resolution
         self.video_mask_type = self.config.model.vision_encoder.video_mask_type
-        self.video_window_size = (num_frames // tublet_size, img_size // patch_size, img_size // patch_size)
+        self.video_window_size = (
+            num_frames // tublet_size,
+            img_size // patch_size,
+            img_size // patch_size,
+        )
         self.video_mask_ratio = self.config.model.vision_encoder.video_mask_ratio
         self.image_mask_type = self.config.model.vision_encoder.image_mask_type
         self.image_window_size = (1, img_size // patch_size, img_size // patch_size)
         self.image_mask_ratio = self.config.model.vision_encoder.image_mask_ratio
-        
+
         return vision_encoder
 
     def build_text_encoder(self):
@@ -254,7 +363,7 @@ class InternVideo2_Stage2(nn.Module):
         encoder_name = self.config.model.text_encoder.name
 
         if "bert" in encoder_name:
-            text_encoder = build_bert(
+            text_encoder = InternVideo2_Stage2.build_bert(
                 self.config.model,
                 self.is_pretrain,
                 self.config.gradient_checkpointing,
@@ -268,9 +377,8 @@ class InternVideo2_Stage2(nn.Module):
         """get text encoder, used for text and cross-modal encoding"""
         encoder = self.text_encoder
         return encoder.bert if hasattr(encoder, "bert") else encoder
-    
-    def get_vid_feat(self, 
-                     frames: torch.Tensor):
+
+    def get_vid_feat(self, frames: torch.Tensor):
         """get the video features for the given frames.
 
         Args:
@@ -281,31 +389,30 @@ class InternVideo2_Stage2(nn.Module):
             - pooled_vision_embeds (torch.Tensor): The pooled output features. Shape: [B,1,C].
 
         """
-        with torch.no_grad():  
+        with torch.no_grad():
             _, vfeat = self.encode_vision(frames, test=True)
             vfeat = self.vision_proj(vfeat)
             vfeat /= vfeat.norm(dim=-1, keepdim=True)
         return vfeat
-    
-    def get_txt_feat(self, 
-                     text: str):
+
+    def get_txt_feat(self, text: str):
         """get the text features for the given text."""
         with torch.no_grad():
             text = self.tokenizer(
-                text, 
-                padding="max_length", 
-                truncation=True, 
-                max_length=self.config.max_txt_l, 
-                return_tensors="pt",).to(self.config.device)
+                text,
+                padding="max_length",
+                truncation=True,
+                max_length=self.config.max_txt_l,
+                return_tensors="pt",
+            ).to(self.config.device)
             _, tfeat = self.encode_text(text)
             tfeat = self.text_proj(tfeat)
             tfeat /= tfeat.norm(dim=-1, keepdim=True)
         return tfeat
-    
-    def predict_label(self, 
-                      vid_feat: torch.Tensor, 
-                      txt_feat: torch.Tensor, 
-                      top: int=5):
+
+    def predict_label(
+        self, vid_feat: torch.Tensor, txt_feat: torch.Tensor, top: int = 5
+    ):
         label_probs = (100.0 * vid_feat @ txt_feat.T).softmax(dim=-1)
         top_probs, top_labels = label_probs.float().cpu().topk(top, dim=-1)
         return top_probs, top_labels
