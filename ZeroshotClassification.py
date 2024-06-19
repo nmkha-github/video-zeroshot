@@ -1,6 +1,7 @@
 import os, sys
 import torch
-from video_utils import frames2tensor
+import numpy as np
+from video_utils import frame_preprocess, frames2tensor, resize_frames
 
 
 class ZeroshotClassification:
@@ -9,9 +10,7 @@ class ZeroshotClassification:
         self.class_names = class_names
         self.model_name = model_name
         self.model, self.tokenizer = self.get_model_and_tokenizer()
-        self.class_name_feature = self.get_text_feature(
-            class_names, self.model, self.tokenizer
-        )
+        self.class_name_feature = self.get_text_feature(class_names)
 
     def get_model_and_tokenizer(self):
         if self.model_name == "ViClip":
@@ -30,6 +29,28 @@ class ZeroshotClassification:
                 ),
             )
             return ViCLIP_model, tokenizer
+        elif self.model_name == "S3D":
+            sys.path.append(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "libs/S3D")
+            )
+            from libs.S3D.s3dg import S3D
+
+            S3D_model = S3D(
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "saved_model/s3d_dict.npy",
+                ),
+                512,
+            )
+            S3D_model.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "saved_model/s3d_howto100m.pth",
+                    )
+                )
+            )
+            return S3D_model.to(self.device), None
 
         elif self.model_name == "InternVideo2":
             sys.path.append(
@@ -58,28 +79,71 @@ class ZeroshotClassification:
             InternVideo2_model, tokenizer = setup_internvideo2(config)
             return InternVideo2_model, tokenizer
 
-    def get_text_feature(self, list_text, model, tokenizer):
-        text_feat_d = {}
-        for text in list_text:
-            feature = model.get_text_features(text, tokenizer, text_feat_d)
-            text_feat_d[text] = feature
-        return torch.cat([text_feat_d[text] for text in list_text], 0).to(self.device)
+    def get_text_feature(self, list_text):
+        with torch.no_grad():
+            if self.model_name == "ViClip":
+                text_feat_d = {}
+                for text in list_text:
+                    feature = self.model.get_text_features(
+                        text, self.tokenizer, text_feat_d
+                    )
+                    text_feat_d[text] = feature
+                return torch.cat([text_feat_d[text] for text in list_text], 0).to(
+                    self.device
+                )
+            if self.model_name == "S3D":
+                self.model.to(self.device)
+                features_dict = self.model.text_module.to(self.device)(list_text)
+                return features_dict["text_embedding"]
 
-    def predict(self, opencv_frames):
-        if self.model_name == "ViClip":
-            model = model.to(self.device)
-            frames_tensor = frames2tensor(opencv_frames)
-            video_feature = model.get_vid_features(frames_tensor)
-            prob = model.get_predict_label(video_feature, self.class_name_feature)
-            return prob
-        if self.model_name == "InternVideo2":
-            prob = None
-            return prob
+    def predict(self, opencv_frames_list):
+        with torch.no_grad():
+            self.model.eval()
+            if self.model_name == "ViClip":
+                self.model = self.model.to(self.device)
+                frames_tensor = frames2tensor(opencv_frames_list)
+                video_feature = self.model.get_vid_features(frames_tensor)
+                prob = self.model.get_predict_label(
+                    video_feature, self.class_name_feature
+                )
+                predict_action = torch.argmax(prob)
+                return prob, predict_action
+            elif self.model_name == "S3D":
+                self.model = self.model.to(self.device)
+                frames_tensor = torch.from_numpy(
+                    np.array([frame_preprocess(x) for x in opencv_frames_list])
+                )
+                frames_tensor = (
+                    resize_frames(frames_tensor.permute(3, 0, 1, 2).unsqueeze(0))
+                    .type(torch.FloatTensor)
+                    .to(self.device)
+                )
+                video_feature = self.model(frames_tensor)["video_embedding"]
+                prob = (video_feature @ self.class_name_feature.t()).softmax(dim=-1)
+                predict_action = torch.argmax(prob)
+                return prob, predict_action
+            elif self.model_name == "InternVideo2":
+                prob = None
+                return prob
 
 
-class_names = ["stand", "sit"]
-ViClip_classification = ZeroshotClassification(class_names)
-print("ViClip success")
+# class_names = [
+#     "put hand near socket",
+#     "near knife",
+#     "near kettle",
+#     "put small object to mouth",
+#     "running",
+#     "sitting",
+#     "swimming",
+#     "drowning",
+#     "falling",
+#     "eating",
+#     "smile",
+#     "choke",
+#     "bleeding",
+# ]
+# ViClip_classification = ZeroshotClassification(class_names)
+# print("ViClip success")
 
 # InternVideo2_classification = ZeroshotClassification(class_names, "InternVideo2")
 # print("InternVideo2 success")
